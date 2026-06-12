@@ -1,0 +1,5 @@
+numpy>=1.21
+scipy>=1.7
+# optional:
+#   matplotlib>=3.1   # figures in the example scripts
+#   pyamg>=4.0        # AMG inner solve for the shifted-Laplacian preconditioner

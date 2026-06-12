@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+wave_solvers/examples/*.png

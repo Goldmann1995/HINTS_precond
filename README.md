@@ -17,6 +17,14 @@ note={https://arxiv.org/abs/2208.13273},
 }
 ```
 
+## Traditional wave / Helmholtz solvers and elastic-wave sources (`wave_solvers/`)
+A pure NumPy/SciPy package of **classical (non-learned)** solvers that complement the HINTS hybrid solvers and serve as building blocks for **acoustic-emission (AE) detection**:
+* Helmholtz finite-difference assembly with direct, GMRES/BiCGSTAB, and the **complex shifted-Laplacian (CSLP)** preconditioner of Erlangga–Vuik–Oosterlee — the traditional baseline that HINTS accelerates.
+* Scalar wave-equation FDTD (1D/2D) and a 2D **P-SV elastic** velocity-stress solver (Virieux 1986) with absorbing boundaries and free surfaces.
+* Elastic-wave **excitation sources**: Ricker / ultrasonic tone-burst / AE-step time functions and point-force, **moment-tensor**, double-couple and explosion spatial sources (incl. the Hsu–Nielsen pencil-lead-break AE calibration source).
+
+See [`wave_solvers/README.md`](wave_solvers/README.md) for details, runnable examples, and pointers to established libraries (Devito, k-Wave, SPECFEM, pyamg) for production-scale runs.
+
 ## Numpy-based code: HINTS methodology and small-scale examples
 
 ### Depedencies
