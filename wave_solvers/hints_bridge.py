@@ -41,8 +41,13 @@ def fft_band_energy(field2d, n_low=4):
 
     Returns ``(e_low, e_high)`` where ``e_low`` is the energy in the lowest
     ``n_low`` x ``n_low`` Fourier modes (smooth error that relaxation is slow
-    on and the DeepONet targets) and ``e_high`` is the rest.
+    on and the DeepONet targets) and ``e_high`` is the rest. A 3D input
+    ``(n_comp, nx, nz)`` (vector/elastic field) is summed over components.
     """
+    field2d = np.asarray(field2d)
+    if field2d.ndim == 3:
+        los, his = zip(*(fft_band_energy(c, n_low) for c in field2d))
+        return float(sum(los)), float(sum(his))
     F = np.fft.fft2(field2d)
     P = np.abs(F) ** 2
     mask = np.zeros_like(P, dtype=bool)
@@ -470,12 +475,181 @@ def _build_module_classes():
     return _Module
 
 
-# Resolve the module class at import time only if torch is present, so the
+def _build_vector_module_classes():
+    """Module factory for the vector/elastic DeepONet: configurable number of
+    input channels and output heads (one branch latent pair per component)."""
+    torch = _require_torch()
+    import torch.nn as nn
+
+    class _VBranch(nn.Module):
+        def __init__(self, latent, in_ch, n_heads):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_ch, 32, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
+                nn.AdaptiveAvgPool2d(4), nn.Flatten())
+            self.fc = nn.Sequential(
+                nn.Linear(128 * 16, 256), nn.ReLU(),
+                nn.Linear(256, n_heads * latent))
+            self.latent = latent
+            self.n_heads = n_heads
+
+        def forward(self, x):
+            h = self.fc(self.conv(x))
+            return [h[:, i * self.latent:(i + 1) * self.latent]
+                    for i in range(self.n_heads)]
+
+    class _VTrunk(nn.Module):
+        def __init__(self, latent, n_freq=48, scale=6.0):
+            super().__init__()
+            self.register_buffer('B', torch.randn(2, n_freq) * scale)
+            self.net = nn.Sequential(
+                nn.Linear(2 * n_freq, 128), nn.ReLU(),
+                nn.Linear(128, 128), nn.ReLU(),
+                nn.Linear(128, latent))
+
+        def forward(self, c):
+            proj = 2.0 * np.pi * (c @ self.B)
+            return self.net(torch.cat([torch.sin(proj), torch.cos(proj)], 1))
+
+    class _VModule(nn.Module):
+        def __init__(self, latent, in_ch, n_heads):
+            super().__init__()
+            self.branch = _VBranch(latent, in_ch, n_heads)
+            self.trunk = _VTrunk(latent)
+
+    return _VModule
+
+
+# Resolve the module classes at import time only if torch is present, so the
 # name exists for type hints / construction; otherwise leave a lazy factory.
 try:  # pragma: no cover - exercised indirectly
     _DeepONetModule = _build_module_classes()
+    _VectorDeepONetModule = _build_vector_module_classes()
 except ImportError:  # torch missing: classical paths still import fine
     _DeepONetModule = None
+    _VectorDeepONetModule = None
+
+
+class VectorComplexDeepONet2D:
+    """Complex, **vector-valued** DeepONet for the elastic Navier-Helmholtz
+    system (Stage 2). Predicts ``u = (ux, uz)`` (each complex) from a vector
+    RHS ``f = (fx, fz)`` on a fixed grid.
+
+    Input channels: ``[static material fields..., Re fx, Im fx, Re fz, Im fz]``
+    (normalized). Output heads: ``2 * n_comp`` branch latents giving
+    ``Re/Im`` of each displacement component via independent branch-trunk
+    contractions, rescaled by the RHS norm (exact, since the operator is
+    linear in the RHS).
+
+    Exposes ``apply(field) -> field`` with ``field`` shaped ``(n_comp, nx,
+    nz)`` complex, so ``HINTSSolver``/``make_hints_preconditioner`` (which use
+    ``shape=(n_comp, nx, nz)``) work unchanged from the scalar case.
+    """
+
+    def __init__(self, nx, nz, static_fields, n_comp=2, latent=64,
+                 device='cpu'):
+        torch = _require_torch()
+        self.torch = torch
+        self.nx, self.nz, self.n_comp = nx, nz, n_comp
+        self.latent = latent
+        self.device = device
+        static = np.atleast_3d(np.asarray(static_fields, dtype=float))
+        if static.shape[:2] == (nx, nz):           # (nx, nz, n_static)
+            static = np.moveaxis(static, -1, 0)
+        self.n_static = static.shape[0]
+        self._static_norm = np.stack(
+            [(s - s.mean()) / (s.std() + 1e-8) for s in static], axis=0)
+        in_ch = self.n_static + 2 * n_comp
+        x = np.linspace(0.0, 1.0, nx)
+        z = np.linspace(0.0, 1.0, nz)
+        xx, zz = np.meshgrid(x, z, indexing='ij')
+        coords = np.stack([xx.reshape(-1), zz.reshape(-1)], axis=1)
+        self._coords = torch.tensor(coords, dtype=torch.float32, device=device)
+        self.model = _VectorDeepONetModule(latent, in_ch, 2 * n_comp).to(device)
+
+    def _forward_fields(self, f_fields):
+        """f_fields: (batch, n_comp, nx, nz) complex -> (re, im) each
+        (batch, n_comp, nx, nz)."""
+        torch = self.torch
+        f = np.asarray(f_fields, dtype=complex)
+        b = f.shape[0]
+        norm = np.sqrt(np.mean(np.abs(f) ** 2, axis=(1, 2, 3)))
+        norm = np.where(norm > 0, norm, 1.0)
+        f_n = f / norm[:, None, None, None]
+        static = np.broadcast_to(self._static_norm,
+                                 (b, self.n_static, self.nx, self.nz))
+        chans = [static]
+        for c in range(self.n_comp):
+            chans.append(f_n[:, c].real[:, None])
+            chans.append(f_n[:, c].imag[:, None])
+        branch_in = torch.tensor(np.concatenate(chans, axis=1),
+                                 dtype=torch.float32, device=self.device)
+        trunk = self.model.trunk(self._coords)             # (N, latent)
+        heads = self.model.branch(branch_in)               # list of (b, latent)
+        scale = torch.tensor(norm, dtype=torch.float32,
+                             device=self.device)[:, None]
+        u_re = torch.stack(
+            [(heads[2 * c] @ trunk.T * scale).reshape(b, self.nx, self.nz)
+             for c in range(self.n_comp)], dim=1)
+        u_im = torch.stack(
+            [(heads[2 * c + 1] @ trunk.T * scale).reshape(b, self.nx, self.nz)
+             for c in range(self.n_comp)], dim=1)
+        return u_re, u_im
+
+    def apply(self, residual_field):
+        torch = self.torch
+        with torch.no_grad():
+            u_re, u_im = self._forward_fields(residual_field[None])
+        return u_re[0].cpu().numpy() + 1j * u_im[0].cpu().numpy()
+
+    def fit(self, f_train, u_train, epochs=2000, batch_size=64, lr=1e-3,
+            f_val=None, u_val=None, log_every=200, logger=print):
+        torch = self.torch
+        opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+        sched = torch.optim.lr_scheduler.ExponentialLR(opt, 0.5 ** (1 / 1500))
+        n = f_train.shape[0]
+        u_re_t = torch.tensor(u_train.real, dtype=torch.float32, device=self.device)
+        u_im_t = torch.tensor(u_train.imag, dtype=torch.float32, device=self.device)
+        hist = []
+        for ep in range(epochs):
+            perm = np.random.permutation(n)
+            ep_loss = 0.0
+            for s in range(0, n, batch_size):
+                idx = perm[s:s + batch_size]
+                pre_re, pre_im = self._forward_fields(f_train[idx])
+                loss = (torch.mean((pre_re - u_re_t[idx]) ** 2)
+                        + torch.mean((pre_im - u_im_t[idx]) ** 2))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                ep_loss += loss.item() * len(idx)
+            sched.step()
+            ep_loss /= n
+            hist.append(ep_loss)
+            if (ep + 1) % log_every == 0 or ep == 0:
+                msg = f'  epoch {ep + 1:5d}  train_mse {ep_loss:.3e}'
+                if f_val is not None:
+                    msg += f'  val_rel {self.relative_error(f_val, u_val):.3e}'
+                logger(msg)
+        return np.array(hist)
+
+    def relative_error(self, f_fields, u_fields):
+        torch = self.torch
+        with torch.no_grad():
+            u_re, u_im = self._forward_fields(f_fields)
+        pred = u_re.cpu().numpy() + 1j * u_im.cpu().numpy()
+        num = np.linalg.norm((pred - u_fields).reshape(len(f_fields), -1), axis=1)
+        den = np.linalg.norm(u_fields.reshape(len(f_fields), -1), axis=1) + 1e-30
+        return float(np.mean(num / den))
+
+    def save(self, path):
+        self.torch.save(self.model.state_dict(), path)
+
+    def load(self, path):
+        self.model.load_state_dict(self.torch.load(path, map_location=self.device))
+        self.model.eval()
 
 
 # ===========================================================================
@@ -497,14 +671,16 @@ def generate_dataset(problem, n_samples, rng=None, n_blobs=3, point_frac=0.3):
     """
     rng = np.random.default_rng() if rng is None else rng
     nx, nz = problem.nx, problem.nz
-    f_fields = np.empty((n_samples, nx, nz), dtype=complex)
-    u_fields = np.empty((n_samples, nx, nz), dtype=complex)
+    block = getattr(problem, 'block_size', 1)
+    field_shape = (nx, nz) if block == 1 else (block, nx, nz)
+    f_fields = np.empty((n_samples,) + field_shape, dtype=complex)
+    u_fields = np.empty((n_samples,) + field_shape, dtype=complex)
     x = np.linspace(0, 1, nx)
     z = np.linspace(0, 1, nz)
     xx, zz = np.meshgrid(x, z, indexing='ij')
     lu = spla.splu(problem.A.tocsc())              # one factorization, reused
     for i in range(n_samples):
-        if rng.random() < point_frac:
+        if block == 1 and rng.random() < point_frac:
             cx, cz = rng.uniform(0.1, 0.9, size=2)
             rad = rng.uniform(0.02, 0.06)          # narrow -> near-delta
             weight = rng.normal() + 1j * rng.normal()
@@ -513,6 +689,6 @@ def generate_dataset(problem, n_samples, rng=None, n_blobs=3, point_frac=0.3):
         else:
             f = problem.smooth_random_source(rng=rng, n_blobs=n_blobs)
         u = lu.solve(f)
-        f_fields[i] = f.reshape(nx, nz)
-        u_fields[i] = u.reshape(nx, nz)
+        f_fields[i] = f.reshape(field_shape)
+        u_fields[i] = u.reshape(field_shape)
     return f_fields, u_fields

@@ -16,14 +16,16 @@ The discretization reuses ``helmholtz.helmholtz_matrix_2d`` (5-point stencil,
 heterogeneous wavenumber, Sommerfeld BC) so the classical CSLP baseline in
 ``helmholtz.py`` applies unchanged.
 
-Stage 2 (planned) — **elastic (vector) P-SV** Navier-Helmholtz:
+Stage 2 (this file, current) — **elastic (vector) P-SV** Navier-Helmholtz:
 
     div(sigma(u)) + rho omega^2 u = -f,  sigma = lambda tr(eps) I + 2 mu eps
 
-will be added here as ``ElasticHelmholtz2DProblem`` with a vector unknown
-``u = (ux, uz)``; the scalar class below is deliberately structured so the
-HINTS bridge (complex DeepONet, hybrid iteration, preconditioner) carries
-over with only the per-node block size changing from 1 to 2.
+is implemented as ``ElasticHelmholtz2DProblem`` with a vector unknown
+``u = (ux, uz)`` (second-order finite differences, component-major ordering
+``dof = component * N + node``). The HINTS bridge (complex DeepONet, hybrid
+iteration, FGMRES preconditioner) carries over from the scalar case with the
+per-node block size changing from 1 to 2. Sources include point forces and
+**moment tensors** (the canonical acoustic-emission micro-crack model).
 
 Acoustic-emission workflow (roadmap §0): a source spectrum is solved one
 frequency at a time with HINTS, then synthesised back to a time-domain
@@ -190,3 +192,275 @@ class ScalarHelmholtz2DProblem:
             'points_per_wavelength': float(self.points_per_wavelength()),
             'bc': self.bc,
         }
+
+
+# ---------------------------------------------------------------------------
+# Elastic (vector) P-SV Navier-Helmholtz problem (Stage 2)
+# ---------------------------------------------------------------------------
+import scipy.sparse as _sp  # noqa: E402
+
+
+def lame_from_velocities(vp, vs, rho):
+    """Return (lambda, mu) Lame parameters from (vp, vs, rho)."""
+    mu = rho * vs ** 2
+    lam = rho * vp ** 2 - 2.0 * mu
+    return lam, mu
+
+
+class ElasticHelmholtz2DProblem:
+    """Frequency-domain 2D P-SV elastic (Navier-Helmholtz) system.
+
+    Solves, for the complex displacement ``u = (ux, uz)`` at angular
+    frequency ``omega``,
+
+        div(sigma(u)) + rho omega^2 u = b,
+        sigma = lambda (div u) I + mu (grad u + grad u^T),
+
+    discretized with second-order central differences. Degrees of freedom use
+    **component-major** ordering ``dof = c * N + (ix*nz + iz)`` with ``c = 0``
+    for ``ux`` and ``c = 1`` for ``uz`` (``N = nx*nz``); this lets the HINTS
+    bridge reshape a state vector to ``(2, nx, nz)`` directly.
+
+    Boundaries
+    ----------
+    * ``bc='dirichlet'`` — identity rows (used by the manufactured-solution
+      convergence test).
+    * ``bc='absorbing'`` — a frequency-domain absorbing layer: a complex mass
+      term ``+ i rho omega gamma(x)`` is added near the edges (the Cerjan-style
+      analog of the time-domain sponge in ``elastic_fdtd.py``), so outgoing P
+      and S waves are damped and the operator is complex/indefinite.
+
+    Parameters
+    ----------
+    vp, vs, rho : scalars or (nx, nz) arrays.
+    omega : angular frequency [rad/s].
+    lx, lz : domain size [m].
+    bc : 'absorbing' (default) or 'dirichlet'.
+    abl_width : absorbing-layer width in cells (bc='absorbing').
+    abl_strength : peak damping fraction of omega in the layer.
+    """
+
+    def __init__(self, vp, vs, rho, omega, lx=1.0, lz=1.0, shape=None,
+                 bc='absorbing', abl_width=12, abl_strength=2.0):
+        if np.isscalar(vp):
+            if shape is None:
+                raise ValueError('shape=(nx, nz) required for scalar media')
+            vp = np.full(shape, float(vp))
+        self.vp = np.asarray(vp, dtype=float)
+        self.nx, self.nz = self.vp.shape
+        self.vs = np.broadcast_to(np.asarray(vs, float), self.vp.shape).copy()
+        self.rho = np.broadcast_to(np.asarray(rho, float), self.vp.shape).copy()
+        self.omega = float(omega)
+        self.lx, self.lz = lx, lz
+        self.bc = bc
+        self.abl_width = abl_width
+        self.abl_strength = abl_strength
+        self.lam, self.mu = lame_from_velocities(self.vp, self.vs, self.rho)
+        self.block_size = 2
+        self.N = self.nx * self.nz
+        self._A = None
+
+    @property
+    def ndof(self):
+        return 2 * self.N
+
+    # -- indexing helpers -------------------------------------------------
+    def _ux(self, ix, iz):
+        return ix * self.nz + iz
+
+    def _uz(self, ix, iz):
+        return self.N + ix * self.nz + iz
+
+    def _absorption(self):
+        """Complex diagonal damping gamma(x) (>=0), ramped near the edges."""
+        gx = np.zeros(self.nx)
+        gz = np.zeros(self.nz)
+        w = self.abl_width
+        if w > 0:
+            ramp = (np.arange(w, 0, -1) / w) ** 2
+            gx[:w] = ramp
+            gx[-w:] = ramp[::-1]
+            gz[:w] = ramp
+            gz[-w:] = ramp[::-1]
+        g = np.maximum(gx[:, None], gz[None, :])       # union of layers
+        return self.abl_strength * self.omega * g
+
+    def assemble(self):
+        """Assemble and cache the complex system matrix ``A`` (CSR)."""
+        nx, nz = self.nx, self.nz
+        dx = self.lx / (nx - 1)
+        dz = self.lz / (nz - 1)
+        lam, mu, rho = self.lam, self.mu, self.rho
+        w2 = self.omega ** 2
+        absorb = self._absorption() if self.bc == 'absorbing' else None
+
+        A = _sp.lil_matrix((self.ndof, self.ndof), dtype=complex)
+        interior = lambda i, j: 0 < i < nx - 1 and 0 < j < nz - 1
+
+        for ix in range(nx):
+            for iz in range(nz):
+                rx, rz = self._ux(ix, iz), self._uz(ix, iz)
+                if not interior(ix, iz):
+                    if self.bc == 'dirichlet':
+                        A[rx, rx] = 1.0
+                        A[rz, rz] = 1.0
+                        continue
+                    # absorbing: still apply the PDE at the boundary using the
+                    # one-sided neighbours collapsed into the diagonal (cheap,
+                    # damped by the ABL anyway). Use identity-free reflection:
+                    # treat as interior with clamped indices.
+                l2m = lam[ix, iz] + 2.0 * mu[ix, iz]
+                lm = lam[ix, iz] + mu[ix, iz]
+                m = mu[ix, iz]
+                mass = rho[ix, iz] * w2
+                if absorb is not None:
+                    mass = mass + 1j * rho[ix, iz] * absorb[ix, iz]
+
+                ip = min(ix + 1, nx - 1); im = max(ix - 1, 0)
+                jp = min(iz + 1, nz - 1); jm = max(iz - 1, 0)
+
+                # --- ux equation: (lam+2mu) ux_xx + mu ux_zz + (lam+mu) uz_xz
+                A[rx, self._ux(ip, iz)] += l2m / dx ** 2
+                A[rx, self._ux(im, iz)] += l2m / dx ** 2
+                A[rx, self._ux(ix, jp)] += m / dz ** 2
+                A[rx, self._ux(ix, jm)] += m / dz ** 2
+                A[rx, rx] += -2.0 * l2m / dx ** 2 - 2.0 * m / dz ** 2 + mass
+                cxz = lm / (4.0 * dx * dz)
+                A[rx, self._uz(ip, jp)] += cxz
+                A[rx, self._uz(im, jm)] += cxz
+                A[rx, self._uz(ip, jm)] -= cxz
+                A[rx, self._uz(im, jp)] -= cxz
+
+                # --- uz equation: mu uz_xx + (lam+2mu) uz_zz + (lam+mu) ux_xz
+                A[rz, self._uz(ip, iz)] += m / dx ** 2
+                A[rz, self._uz(im, iz)] += m / dx ** 2
+                A[rz, self._uz(ix, jp)] += l2m / dz ** 2
+                A[rz, self._uz(ix, jm)] += l2m / dz ** 2
+                A[rz, rz] += -2.0 * m / dx ** 2 - 2.0 * l2m / dz ** 2 + mass
+                A[rz, self._ux(ip, jp)] += cxz
+                A[rz, self._ux(im, jm)] += cxz
+                A[rz, self._ux(ip, jm)] -= cxz
+                A[rz, self._ux(im, jp)] -= cxz
+
+        A = A.tocsr()
+        self._A = A
+        return A
+
+    @property
+    def A(self):
+        if self._A is None:
+            self.assemble()
+        return self._A
+
+    # -- sources ----------------------------------------------------------
+    def point_force(self, ix, iz, fx=0.0, fz=1.0, amplitude=1.0):
+        """RHS for a point body force (fx, fz) at node (ix, iz)."""
+        b = np.zeros(self.ndof, dtype=complex)
+        b[self._ux(ix, iz)] = amplitude * fx
+        b[self._uz(ix, iz)] = amplitude * fz
+        return b
+
+    def moment_tensor(self, ix, iz, mxx=1.0, mzz=1.0, mxz=0.0, amplitude=1.0):
+        """RHS for a moment-tensor source ``f_i = -d_j (M_ij delta)``,
+        discretized by central differences — the canonical AE micro-crack
+        source (shear: mxz; volumetric/explosive: mxx=mzz)."""
+        nx, nz = self.nx, self.nz
+        dx = self.lx / (nx - 1)
+        dz = self.lz / (nz - 1)
+        b = np.zeros(self.ndof, dtype=complex)
+        a = amplitude
+        # fx = -(d/dx)(Mxx delta) - (d/dz)(Mxz delta)
+        b[self._ux(min(ix + 1, nx - 1), iz)] += -a * mxx / (2 * dx)
+        b[self._ux(max(ix - 1, 0), iz)] += a * mxx / (2 * dx)
+        b[self._ux(ix, min(iz + 1, nz - 1))] += -a * mxz / (2 * dz)
+        b[self._ux(ix, max(iz - 1, 0))] += a * mxz / (2 * dz)
+        # fz = -(d/dx)(Mxz delta) - (d/dz)(Mzz delta)
+        b[self._uz(min(ix + 1, nx - 1), iz)] += -a * mxz / (2 * dx)
+        b[self._uz(max(ix - 1, 0), iz)] += a * mxz / (2 * dx)
+        b[self._uz(ix, min(iz + 1, nz - 1))] += -a * mzz / (2 * dz)
+        b[self._uz(ix, max(iz - 1, 0))] += a * mzz / (2 * dz)
+        return b
+
+    def smooth_random_source(self, rng=None, n_blobs=3):
+        """Smooth complex vector RHS (random Gaussian blobs per component) —
+        the training distribution for the vector HINTS DeepONet."""
+        rng = np.random.default_rng() if rng is None else rng
+        x = np.linspace(0, 1, self.nx)
+        z = np.linspace(0, 1, self.nz)
+        xx, zz = np.meshgrid(x, z, indexing='ij')
+        b = np.zeros(self.ndof, dtype=complex)
+        for comp, off in ((0, 0), (1, self.N)):
+            field = np.zeros((self.nx, self.nz), dtype=complex)
+            for _ in range(n_blobs):
+                cx, cz = rng.uniform(0.15, 0.85, size=2)
+                rad = rng.uniform(0.06, 0.18)
+                wt = rng.normal() + 1j * rng.normal()
+                field += wt * np.exp(-((xx - cx) ** 2 + (zz - cz) ** 2)
+                                     / (2.0 * rad ** 2))
+            b[off:off + self.N] = field.reshape(-1)
+        return b
+
+    def solve_direct(self, b):
+        return _hz.solve_direct(self.A, b)
+
+    def to_fields(self, vec):
+        """Reshape a state vector to ``(2, nx, nz)`` complex fields."""
+        return np.asarray(vec).reshape(2, self.nx, self.nz)
+
+    def points_per_wavelength(self):
+        """PPW for the slower (shear) wave — the binding resolution limit."""
+        dx = self.lx / (self.nx - 1)
+        dz = self.lz / (self.nz - 1)
+        ks_max = self.omega / np.min(self.vs)
+        lam_min = 2.0 * np.pi / ks_max
+        return lam_min / max(dx, dz)
+
+    def nondim(self):
+        return {
+            'ndof': self.ndof,
+            'vp_over_vs': float(np.mean(self.vp / self.vs)),
+            'shear_ppw': float(self.points_per_wavelength()),
+            'bc': self.bc,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Frequency <-> time synthesis (AE waveform modelling, roadmap §3)
+# ---------------------------------------------------------------------------
+def source_spectrum(stf, dt):
+    """Return (frequencies [Hz], complex spectrum) of a source-time function
+    sampled at ``dt`` via the real FFT."""
+    spec = np.fft.rfft(stf)
+    freqs = np.fft.rfftfreq(len(stf), d=dt)
+    return freqs, spec
+
+
+def freq_to_time(solve_one, freqs, spectrum, n_time, dt, freq_band=None):
+    """Synthesize a time-domain response from per-frequency solves.
+
+    For each frequency ``f`` in ``freqs`` (optionally restricted to
+    ``freq_band = (fmin, fmax)``), ``solve_one(omega)`` returns the complex
+    response to a unit harmonic source; it is scaled by the source spectrum
+    and accumulated, then inverse-FFT'd to the time domain.
+
+    Returns a real array of shape ``(n_time,) + response_shape``.
+    """
+    freqs = np.asarray(freqs)
+    sel = np.ones(len(freqs), dtype=bool)
+    if freq_band is not None:
+        sel &= (freqs >= freq_band[0]) & (freqs <= freq_band[1])
+    sel &= freqs > 0.0
+
+    acc = None
+    nfreq = len(freqs)
+    for idx in np.where(sel)[0]:
+        omega = 2.0 * np.pi * freqs[idx]
+        resp = np.asarray(solve_one(omega)) * spectrum[idx]
+        if acc is None:
+            acc = np.zeros((nfreq,) + resp.shape, dtype=complex)
+        acc[idx] = resp
+    if acc is None:
+        raise ValueError('no frequencies selected')
+    # inverse real FFT back to the time domain
+    time_series = np.fft.irfft(acc, n=n_time, axis=0)
+    return time_series
