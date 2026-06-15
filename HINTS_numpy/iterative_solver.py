@@ -1,12 +1,16 @@
 import configs
 import utils
 import numpy as np
-from scipy.interpolate import interp2d
+try:
+    from scipy.interpolate import interp2d
+except ImportError:  # interp2d removed in SciPy >=1.14; only used in 2D paths
+    interp2d = None
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
 from deeponet import DeepONet
 from torch import load as torch_load
+from torch.nn import Parameter as torch_parameter
 import time
 import tracemalloc
 
@@ -187,9 +191,9 @@ class DeepONetSolver():
         self.deeponet = DeepONet(self.x_nodes_don, logger,
                                  y_nodes=self.y_nodes_don, z_nodes=self.z_nodes_don)
         if model_path is not None:
-            self.deeponet.branch_net = torch_load(os.path.join(model_path, 'branch_model'))
-            self.deeponet.trunk_net = torch_load(os.path.join(model_path, 'trunk_model'))
-            self.deeponet.bias = torch_load(os.path.join(model_path, 'bias'))
+            self.deeponet.branch_net = torch_load(os.path.join(model_path, 'branch_model'), weights_only=False).to(configs.DEVICE)
+            self.deeponet.trunk_net = torch_load(os.path.join(model_path, 'trunk_model'), weights_only=False).to(configs.DEVICE)
+            self.deeponet.bias = torch_parameter(torch_load(os.path.join(model_path, 'bias'), weights_only=False).to(configs.DEVICE))
         self.k_func = k_func
 
     def iterate_once(self, u_approx):

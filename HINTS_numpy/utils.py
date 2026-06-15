@@ -9,7 +9,10 @@ import pickle
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.spatial import Delaunay
 from scipy.io import loadmat
-from scipy.interpolate import interp2d
+try:
+    from scipy.interpolate import interp2d
+except ImportError:  # interp2d removed in SciPy >=1.14; only used in 2D paths
+    interp2d = None
 
 
 logging.basicConfig(level=logging.INFO,

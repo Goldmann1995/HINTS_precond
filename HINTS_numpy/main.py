@@ -5,7 +5,11 @@ from iterative_solver import IterativeSolver, MultiGrid
 from deeponet import DeepONet
 from utils import logger, init_simple
 import configs
-from scipy.interpolate import interp2d, interpn
+from scipy.interpolate import interpn
+try:
+    from scipy.interpolate import interp2d
+except ImportError:  # interp2d removed in SciPy >=1.14; only used in 2D paths
+    interp2d = None
 
 
 logger.setLevel(15)

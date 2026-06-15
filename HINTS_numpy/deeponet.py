@@ -4,7 +4,11 @@ import configs
 import time
 import utils
 import numpy as np
-from scipy.interpolate import interp2d, griddata, interpn
+from scipy.interpolate import griddata, interpn
+try:
+    from scipy.interpolate import interp2d
+except ImportError:  # interp2d removed in SciPy >=1.14; only used in 2D paths
+    interp2d = None
 
 
 class DeepONet(nn.Module):
