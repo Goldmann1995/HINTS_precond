@@ -151,6 +151,7 @@ class HINTSSolver:
         b_norm = max(np.linalg.norm(b), 1e-300)
         res_hist, don_steps = [], []
         band_low, band_high = [], []
+        diverged = False
 
         for it in range(1, maxiter + 1):
             u = self.smoother(A, b, u)
@@ -170,10 +171,17 @@ class HINTSSolver:
                 band_high.append(hi)
             if not np.isfinite(res) or res < rtol:
                 break
+            # divergence guard: a standalone net can pollute the near-null
+            # space of an indefinite operator without raising the residual,
+            # which later blows up the smoother. Stop cleanly when it does.
+            if res > 1e3 * res_hist[0]:
+                diverged = True
+                break
 
         info = {
             'converged': bool(res_hist and np.isfinite(res_hist[-1])
                               and res_hist[-1] < rtol),
+            'diverged': diverged,
             'iterations': len(res_hist),
             'residuals': np.array(res_hist),
             'don_steps': np.array(don_steps),
