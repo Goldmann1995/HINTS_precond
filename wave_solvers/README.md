@@ -19,6 +19,8 @@ Everything here is pure NumPy/SciPy — no Firedrake/PETSc needed.
 | `wave_fdtd.py` | 1D/2D scalar acoustic wave equation, 2nd-order leapfrog FDTD, with **Mur** and **Cerjan sponge** absorbing boundaries and a CFL guard. |
 | `elastic_fdtd.py` | 2D P-SV elastic wave propagation, **Virieux (1986)** velocity-stress staggered grid, free surfaces (Rayleigh/Lamb waves), absorbing sponge. |
 | `sources.py` | Source-time functions (Ricker, Gaussian, **ultrasonic tone burst**, **AE step / pencil-break**) and spatial sources (point force, **moment tensor**, double-couple, explosion). |
+| `elastic_helmholtz.py` | Frequency-domain (complex) Helmholtz assembly for HINTS: scalar acoustic (`ScalarHelmholtz2DProblem`, Stage 1) and **elastic vector P-SV Navier-Helmholtz** (`ElasticHelmholtz2DProblem`, Stage 2), plus `freq_to_time` AE-waveform synthesis. |
+| `hints_bridge.py` | Blends a complex DeepONet with relaxation / CSLP to solve the above systems: standalone hybrid (`HINTSSolver`), flexible-GMRES preconditioner (`fgmres`, `make_hints_preconditioner`), scalar and **vector** complex DeepONets, spectral-complementarity diagnostics. Requires PyTorch for the network paths. |
 
 ## Quick start
 

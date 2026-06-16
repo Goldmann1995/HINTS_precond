@@ -301,23 +301,29 @@ class ElasticHelmholtz2DProblem:
             for iz in range(nz):
                 rx, rz = self._ux(ix, iz), self._uz(ix, iz)
                 if not interior(ix, iz):
-                    if self.bc == 'dirichlet':
-                        A[rx, rx] = 1.0
-                        A[rz, rz] = 1.0
-                        continue
-                    # absorbing: still apply the PDE at the boundary using the
-                    # one-sided neighbours collapsed into the diagonal (cheap,
-                    # damped by the ABL anyway). Use identity-free reflection:
-                    # treat as interior with clamped indices.
+                    # Both BCs use a Dirichlet (u = 0) frame: identity rows.
+                    # For 'absorbing' the interior ABL damps outgoing waves
+                    # before they reach this frame, so reflections are small;
+                    # crucially this keeps the interior operator symmetric, so
+                    # the discrete Green's function satisfies reciprocity (a
+                    # clamped-index "boundary stencil" would break both).
+                    A[rx, rx] = 1.0
+                    A[rz, rz] = 1.0
+                    continue
                 l2m = lam[ix, iz] + 2.0 * mu[ix, iz]
                 lm = lam[ix, iz] + mu[ix, iz]
                 m = mu[ix, iz]
                 mass = rho[ix, iz] * w2
                 if absorb is not None:
-                    mass = mass + 1j * rho[ix, iz] * absorb[ix, iz]
+                    # numpy IFFT uses the e^{+i omega t} convention, for which
+                    # time-domain velocity damping (rho gamma d_t u) maps to a
+                    # mass term rho(omega^2 - i omega gamma): the -i sign makes
+                    # outgoing waves decay (causal). The opposite sign yields
+                    # incoming/time-reversed (acausal) solutions.
+                    mass = mass - 1j * rho[ix, iz] * absorb[ix, iz]
 
-                ip = min(ix + 1, nx - 1); im = max(ix - 1, 0)
-                jp = min(iz + 1, nz - 1); jm = max(iz - 1, 0)
+                ip, im = ix + 1, ix - 1     # interior: neighbours are valid
+                jp, jm = iz + 1, iz - 1
 
                 # --- ux equation: (lam+2mu) ux_xx + mu ux_zz + (lam+mu) uz_xz
                 A[rx, self._ux(ip, iz)] += l2m / dx ** 2

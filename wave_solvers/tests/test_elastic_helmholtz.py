@@ -121,6 +121,27 @@ def test_freq_to_time_synthesis():
     print('  [ok] frequency<->time synthesis round-trips the source wavelet')
 
 
+def test_elastic_reciprocity():
+    """Elastodynamic reciprocity: the displacement response is symmetric in
+    source/receiver. A rigorous, ML-independent physical correctness check
+    that also exercises the absorbing layer. Uses nondimensional O(1) media
+    so the system is well-conditioned (roadmap §2.3); with realistic Lame
+    values spanning ~15 orders of magnitude the *solve* is roundoff-limited
+    even though the operator's interior block is exactly symmetric."""
+    p = eh.ElasticHelmholtz2DProblem(2.0, 1.0, 1.0, 6.0, shape=(40, 40),
+                                     bc='absorbing', abl_width=8)
+    A, B = (20, 18), (25, 22)
+    g_ab = p.solve_direct(p.point_force(*A, fx=0, fz=1.0))[p._uz(*B)]
+    g_ba = p.solve_direct(p.point_force(*B, fx=0, fz=1.0))[p._uz(*A)]
+    rel = abs(g_ab - g_ba) / abs(g_ab)
+    assert rel < 1e-8, f'reciprocity violated (rel {rel:.2e})'
+    # mixed component reciprocity
+    c1 = p.solve_direct(p.point_force(*A, fx=0, fz=1.0))[p._ux(*B)]
+    c2 = p.solve_direct(p.point_force(*B, fx=1.0, fz=0))[p._uz(*A)]
+    assert abs(c1 - c2) / abs(c1) < 1e-6
+    print(f'  [ok] elastodynamic reciprocity holds (rel {rel:.1e})')
+
+
 # ---------------------------------------------------------------------------
 # Vector HINTS bridge plumbing (oracle = exact inverse)
 # ---------------------------------------------------------------------------
@@ -135,8 +156,9 @@ class _VectorOracle:
 
 
 def test_vector_oracle_hints_and_fgmres():
-    p = eh.ElasticHelmholtz2DProblem(3000., 1800., 2500., 2 * np.pi * 120.,
-                                     shape=(40, 40), bc='absorbing')
+    # nondimensional O(1) media -> well-conditioned solve (roadmap §2.3)
+    p = eh.ElasticHelmholtz2DProblem(2.0, 1.0, 1.0, 6.0, shape=(40, 40),
+                                     bc='absorbing', abl_width=8)
     b = p.point_force(20, 20, fx=0.0, fz=1.0)
     u_ref = p.solve_direct(b)
     shape = (p.block_size, p.nx, p.nz)
