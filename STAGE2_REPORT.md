@@ -1,7 +1,7 @@
 # Stage 2 — 弹性矢量 P-SV Navier-Helmholtz 的 HINTS（核心创新）
 
-> 状态：**核心算子严格验证通过；矢量 HINTS 管线端到端打通**
-> 日期：2026-06-16 ｜ 对应 `HINTS_AE_ROADMAP.md` §4 Stage 2
+> 状态：**核心算子严格验证通过；矢量 HINTS 管线端到端打通；PML + 频↔时 FDTD 互校达标（互相关 0.99）**
+> 日期：2026-06-16（更新：加入频域 PML 与 FDTD 定量互校）｜ 对应 `HINTS_AE_ROADMAP.md` §4 Stage 2
 > 代码：`wave_solvers/elastic_helmholtz.py`（`ElasticHelmholtz2DProblem`、`freq_to_time`）、
 > `wave_solvers/hints_bridge.py`（`VectorComplexDeepONet2D`）、
 > 示例 `wave_solvers/examples/hints_elastic_stage2.py`、测试 `wave_solvers/tests/test_elastic_helmholtz.py`
@@ -16,14 +16,19 @@
 - ✅ **矢量 HINTS 桥接端到端打通**：复数矢量 DeepONet（4 输出通道 re/im×ux/uz）可训练；
   `HINTSSolver`/`fgmres`/预条件子原样支持 block_size=2；理想算子下 oracle-HINTS 与
   FGMRES(oracle) **1 步收敛**；示例中 FGMRES 迭代数 none/ILU/HINTS = 244/6/8。
-- ✅ **频↔时合成机制就绪**：`source_spectrum`/`freq_to_time`（IFFT 往返验证通过）。
+- ✅ **频域 PML 实现并验证**：复坐标拉伸 PML（`bc='pml'`）。Green 函数**群延迟因果且等于
+  offset/v_s**（实测 0.538 vs 理论 0.531，误差 1%）——同时验证吸收、因果性、波速正确。
+- ✅ **频↔时 FDTD 定量互校达标（roadmap 核心验证图）**：频域 PML 解 → IFFT 合成速度波形与时域
+  `elastic_fdtd` 的速度波形**互相关 0.999 > 0.95 目标**（零滞后）。已加入自动化测试（快配置 0.976）。
 - ⚠️ **关键经验**：弹性算子在**有量纲**参数下条件数极差（λ,μ ~ 1e10，矩阵元跨 15 个数量级），
   直接解被舍入误差主导（互易性"假性失败"）。**无量纲化（roadmap §2.3）**后一切恢复机器精度。
-- ⏳ **未完成（明确界定）**：频域→时域**声发射波形**与时域 `elastic_fdtd` 的**定量**互校尚未达成
-  >0.95 相关——根因是简单对角吸收层(ABL)无法吸收**波长≈域尺寸**的低频分量（驻波→非因果合成），
-  需**真正的 PML**（roadmap §7 已列为后续）。算子本身已由制造解+互易性验证为正确。
 
-测试：`test_elastic_helmholtz.py` **7/7 通过**；全仓 wave_solvers 测试 **22/22 通过**，无回归。
+测试：`test_elastic_helmholtz.py` **9/9 通过**；全仓 wave_solvers 测试 **24/24 通过**，无回归。
+
+### 频↔时互校成功的三要素
+1. **真正的 PML**（非简单对角吸收层）——后者无法吸收波长≈域尺寸的分量（驻波→非因果）；
+2. **原始（不取共轭）Green 函数**——PML 在 numpy `e^{+iωt}` 约定下已给出因果解；
+3. **速度对速度比较**（响应乘 `iω`）——避免把 FDTD 速度积分成位移引入的漂移。
 
 ---
 
@@ -70,25 +75,27 @@
 
 ---
 
-## 4. 未完成项：AE 波形频↔时定量互校（明确界定 + 方案）
+## 4. AE 波形频↔时定量互校（已达成）
 
-**现象**：频域→IFFT 合成波形与时域 `elastic_fdtd` 的波形互相关仅 ~0.1，合成波形首至非因果。
-**根因（已诊断，非算子错误）**：
-- Ricker 频带的**最低频波长 ≈ 域尺寸**，任何有限吸收层都无法吸收 → 驻波 → 合成非因果；
-- 简单对角 ABL 远不及 **PML**；
-- 配置点(collocated)频域点源与交错网格(staggered)FDTD 力源的**等效性**需要仔细处理；
-- `e^{±iωt}` 约定（numpy IFFT 用 `e^{+iωt}`，需对响应取共轭取因果分支）。
+**结果**：频域弹性 PML 解 → IFFT 合成速度波形，与时域 `elastic_fdtd` 速度波形**互相关 0.999**
+（`examples/elastic_freq_vs_time.py`，零滞后），主 S 波包到时与理论 `offset/v_s` 吻合。
+快配置（n=64, 32 频）已作为自动化测试 `test_pml_freq_vs_time_fdtd`（互相关 0.976 > 0.95）。
 
-**方案（Stage 2.5 / 进入 Stage 3 前）**：实现频域弹性 **PML**（roadmap §7），增大域≫最长波长，
-统一无量纲坐标，再做 FDTD 互校（目标互相关 >0.95、到时误差 < 1 波长）。算子正确性已由制造解 +
-互易性独立保证，此项是**正演管线打磨**而非算子修复。
+**实现要点**：
+- 复坐标拉伸 PML：`s = 1 - iσ/ω`（`e^{+iωt}` 约定下使外行波在层内衰减），σ 二次渐变
+  （Collino & Tsogka 2001 公式），保守变系数二阶差分（半节点 `s`）。内部 `s=1`，退化为标准算子。
+- 群延迟测试 `test_pml_causal_group_delay`：Green 函数群延迟 = `offset/v_s`（1% 误差），因果。
+
+**早先的失败诊断（保留为经验）**：简单对角 ABL 无法吸收波长≈域尺寸的低频 → 驻波→非因果；
+需取原始（非共轭）Green 函数；需速度对速度比较避免积分漂移。三者解决后互相关从 ~0.1 升至 0.999。
 
 ---
 
 ## 5. 复现命令
 
 ```bash
-python wave_solvers/tests/test_elastic_helmholtz.py        # 7/7 通过
+python wave_solvers/tests/test_elastic_helmholtz.py        # 9/9 通过
+python wave_solvers/examples/elastic_freq_vs_time.py        # 频域 PML vs 时域 FDTD（互相关 0.999）
 python wave_solvers/examples/hints_elastic_stage2.py        # 矢量 HINTS 演示（无量纲）
 #   可调：--grid 32 --omega 6 --n-train 1500 --epochs 800
 ```
@@ -100,7 +107,8 @@ python wave_solvers/examples/hints_elastic_stage2.py        # 矢量 HINTS 演�
 | 指标 | 目标 | 实测 | 结论 |
 | --- | --- | --- | --- |
 | 正确性（解 vs 直接解 / 解析） | 频域 ≤1e-6 | 制造解 2 阶；互易性 2e-14；FGMRES 收敛 1e-8 | ✅ |
-| 频域↔时域 FDTD 波形互相关 | >0.95 | ~0.1（待 PML）| ⏳ 明确界定为后续 |
+| **频域↔时域 FDTD 波形互相关** | **>0.95** | **0.999**（PML + 速度比较）| ✅ |
+| PML 因果性 | 群延迟 = offset/v_s | 0.538 vs 0.531（1%）| ✅ |
 | P/S 谱互补图 | 成立 | 诊断工具 `fft_band_energy` 支持矢量；理想算子下成立 | ✅（工具就绪）|
 | 加速（迭代数 vs 经典预条件子） | 显著下降 | 当前弱网络略增（同 Stage 1）| ❌（受 CPU 网络精度限制）|
 
@@ -108,10 +116,12 @@ python wave_solvers/examples/hints_elastic_stage2.py        # 矢量 HINTS 演�
 
 ## 7. Stage 3 交接
 
-- **首要**：频域弹性 PML + 大域，完成 AE 波形定量互校（解锁 roadmap 核心验证图）。
+- ✅ **频域弹性 PML + AE 波形定量互校已完成**（互相关 0.999），roadmap 核心验证图已解锁。
 - **网络精度**：GPU + 更大数据/更长训练（弱网络是不超过经典预条件子的唯一瓶颈，机制已由 oracle 证明）。
 - **多频摊销（Stage 3）**：把 ω 作为分支输入，一张矢量 DeepONet 跨 AE 频带泛化，复用 `freq_to_time`；
-  薄板复现 Lamb 频散。
+  薄板复现 Lamb 频散（PML 可用于无限板/半空间边界）。
+- **HINTS-on-PML**：在 PML 算子上训练矢量 DeepONet 并用 FGMRES 加速（PML 算子复对称性较弱，
+  需评估预条件子选择）。
 
-**判定：Stage 2 的核心创新（矢量/弹性 HINTS 算子）已实现并严格验证；AE 波形定量互校界定为
-需 PML 的后续工程项，已给出明确诊断与方案。**
+**判定：Stage 2 的核心创新（矢量/弹性 HINTS 算子）已实现并严格验证；频域 PML 与频↔时 FDTD
+定量互校（互相关 0.999 > 0.95 目标）已达成。**

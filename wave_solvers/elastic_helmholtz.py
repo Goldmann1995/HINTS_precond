@@ -241,7 +241,8 @@ class ElasticHelmholtz2DProblem:
     """
 
     def __init__(self, vp, vs, rho, omega, lx=1.0, lz=1.0, shape=None,
-                 bc='absorbing', abl_width=12, abl_strength=2.0):
+                 bc='absorbing', abl_width=12, abl_strength=2.0,
+                 pml_width=12, pml_R=1e-4, pml_m=2):
         if np.isscalar(vp):
             if shape is None:
                 raise ValueError('shape=(nx, nz) required for scalar media')
@@ -255,6 +256,9 @@ class ElasticHelmholtz2DProblem:
         self.bc = bc
         self.abl_width = abl_width
         self.abl_strength = abl_strength
+        self.pml_width = pml_width
+        self.pml_R = pml_R
+        self.pml_m = pml_m
         self.lam, self.mu = lame_from_velocities(self.vp, self.vs, self.rho)
         self.block_size = 2
         self.N = self.nx * self.nz
@@ -287,6 +291,8 @@ class ElasticHelmholtz2DProblem:
 
     def assemble(self):
         """Assemble and cache the complex system matrix ``A`` (CSR)."""
+        if self.bc == 'pml':
+            return self._assemble_pml()
         nx, nz = self.nx, self.nz
         dx = self.lx / (nx - 1)
         dz = self.lz / (nz - 1)
@@ -347,6 +353,96 @@ class ElasticHelmholtz2DProblem:
                 A[rz, self._ux(im, jm)] += cxz
                 A[rz, self._ux(ip, jm)] -= cxz
                 A[rz, self._ux(im, jp)] -= cxz
+
+        A = A.tocsr()
+        self._A = A
+        return A
+
+    # -- perfectly matched layer (complex-coordinate stretching) ----------
+    def _pml_stretch(self):
+        """Per-node complex stretch factors ``s_x(x), s_z(z) = 1 - i sigma/omega``.
+
+        ``sigma`` ramps up quadratically inside a layer of ``pml_width`` cells
+        at each edge and is zero in the interior. With numpy's e^{+i omega t}
+        convention the ``-i`` sign makes outgoing waves decay inside the layer
+        (a perfectly matched layer reflects almost nothing at any angle, unlike
+        the simple diagonal 'absorbing' layer which cannot damp wavelengths
+        comparable to the domain).
+        """
+        w = self.pml_width
+        dx = self.lx / (self.nx - 1)
+        c_ref = float(np.max(self.vp))
+        # classical PML conductivity profile (Collino & Tsogka 2001)
+        L = max(w * dx, 1e-30)
+        sigma0 = -(self.pml_m + 1) * c_ref * np.log(self.pml_R) / (2.0 * L)
+
+        def axis_sigma(nn):
+            s = np.zeros(nn)
+            if w > 0:
+                d = (np.arange(w, 0, -1) / w) ** self.pml_m   # 1 at edge -> 0
+                s[:w] = sigma0 * d
+                s[-w:] = sigma0 * d[::-1]
+            return s
+        sx = 1.0 - 1j * axis_sigma(self.nx) / self.omega
+        sz = 1.0 - 1j * axis_sigma(self.nz) / self.omega
+        return sx, sz
+
+    def _assemble_pml(self):
+        """Assemble the elastic operator with a complex-coordinate-stretching
+        PML. Reduces to the standard operator in the interior (s = 1)."""
+        nx, nz = self.nx, self.nz
+        dx = self.lx / (nx - 1)
+        dz = self.lz / (nz - 1)
+        lam, mu, rho = self.lam, self.mu, self.rho
+        w2 = self.omega ** 2
+        sx, sz = self._pml_stretch()
+        sxh = 0.5 * (sx[:-1] + sx[1:])      # half-node i+1/2, length nx-1
+        szh = 0.5 * (sz[:-1] + sz[1:])
+        interior = lambda i, j: 0 < i < nx - 1 and 0 < j < nz - 1
+
+        A = _sp.lil_matrix((self.ndof, self.ndof), dtype=complex)
+        for ix in range(nx):
+            for iz in range(nz):
+                rx, rz = self._ux(ix, iz), self._uz(ix, iz)
+                if not interior(ix, iz):
+                    A[rx, rx] = 1.0
+                    A[rz, rz] = 1.0
+                    continue
+                l2m = lam[ix, iz] + 2.0 * mu[ix, iz]
+                lm = lam[ix, iz] + mu[ix, iz]
+                m = mu[ix, iz]
+                mass = rho[ix, iz] * w2
+                # conservative stretched second derivatives:
+                #   Dxx u|i = 1/(sx_i dx^2)[ (u_{i+1}-u_i)/sxh_i
+                #                            - (u_i-u_{i-1})/sxh_{i-1} ]
+                axp = 1.0 / (sx[ix] * sxh[ix] * dx ** 2)        # i+1/2
+                axm = 1.0 / (sx[ix] * sxh[ix - 1] * dx ** 2)    # i-1/2
+                azp = 1.0 / (sz[iz] * szh[iz] * dz ** 2)
+                azm = 1.0 / (sz[iz] * szh[iz - 1] * dz ** 2)
+                # cross term scaled by 1/(sx_i sz_j)
+                cxz = lm / (sx[ix] * sz[iz] * 4.0 * dx * dz)
+
+                # --- ux equation -----------------------------------------
+                A[rx, self._ux(ix + 1, iz)] += l2m * axp
+                A[rx, self._ux(ix - 1, iz)] += l2m * axm
+                A[rx, self._ux(ix, iz + 1)] += m * azp
+                A[rx, self._ux(ix, iz - 1)] += m * azm
+                A[rx, rx] += -l2m * (axp + axm) - m * (azp + azm) + mass
+                A[rx, self._uz(ix + 1, iz + 1)] += cxz
+                A[rx, self._uz(ix - 1, iz - 1)] += cxz
+                A[rx, self._uz(ix + 1, iz - 1)] -= cxz
+                A[rx, self._uz(ix - 1, iz + 1)] -= cxz
+
+                # --- uz equation -----------------------------------------
+                A[rz, self._uz(ix + 1, iz)] += m * axp
+                A[rz, self._uz(ix - 1, iz)] += m * axm
+                A[rz, self._uz(ix, iz + 1)] += l2m * azp
+                A[rz, self._uz(ix, iz - 1)] += l2m * azm
+                A[rz, rz] += -m * (axp + axm) - l2m * (azp + azm) + mass
+                A[rz, self._ux(ix + 1, iz + 1)] += cxz
+                A[rz, self._ux(ix - 1, iz - 1)] += cxz
+                A[rz, self._ux(ix + 1, iz - 1)] -= cxz
+                A[rz, self._ux(ix - 1, iz + 1)] -= cxz
 
         A = A.tocsr()
         self._A = A

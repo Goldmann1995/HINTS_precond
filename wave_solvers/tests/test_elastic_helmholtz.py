@@ -85,6 +85,35 @@ def test_elastic_truncation_consistency():
           f'({rels[0]:.1e} -> {rels[1]:.1e})')
 
 
+def test_pml_causal_group_delay():
+    """The PML must produce a *causal* Green's function whose group delay at a
+    receiver equals offset / wave-speed. A vertical point force radiates
+    SV-dominated energy along x, so the group delay of u_z at an x-offset
+    receiver should match offset / vs. This validates the PML + operator +
+    time-convention together (an acausal/reflecting boundary fails it).
+    Nondimensional, well-conditioned medium."""
+    vp, vs, rho = 1.0, 0.571, 1.0
+    n, L = 100, 1.0
+    dx = L / (n - 1)
+    src, rec = (35, 50), (65, 50)
+    offset = abs(rec[0] - src[0]) * dx
+    freqs = np.linspace(2.0, 6.0, 16)
+    phase = []
+    for f in freqs:
+        p = eh.ElasticHelmholtz2DProblem(vp, vs, rho, 2 * np.pi * f, lx=L, lz=L,
+                                         shape=(n, n), bc='pml', pml_width=20)
+        g = p.solve_direct(-p.point_force(*src, fx=0.0, fz=1.0))[p._uz(*rec)]
+        phase.append(np.angle(g))
+    slope = np.polyfit(2 * np.pi * freqs, np.unwrap(phase), 1)[0]
+    group_delay = -slope
+    expected = offset / vs                      # SV arrival
+    rel = abs(group_delay - expected) / expected
+    assert group_delay > 0, 'group delay is acausal (negative)'
+    assert rel < 0.08, f'PML group delay {group_delay:.3f} != S delay {expected:.3f}'
+    print(f'  [ok] PML causal group delay {group_delay:.3f} ~ offset/vs '
+          f'{expected:.3f} (rel {rel:.2f})')
+
+
 def test_moment_tensor_and_force_radiate():
     p = eh.ElasticHelmholtz2DProblem(3000., 1800., 2500., 2 * np.pi * 150.,
                                      shape=(64, 64), bc='absorbing')
@@ -119,6 +148,62 @@ def test_freq_to_time_synthesis():
     err = np.linalg.norm(out[:, 0] - stf) / np.linalg.norm(stf)
     assert err < 1e-6, f'IFFT round-trip failed (err {err:.2e})'
     print('  [ok] frequency<->time synthesis round-trips the source wavelet')
+
+
+def test_pml_freq_vs_time_fdtd():
+    """Headline Stage 2 check (roadmap §4): the frequency-domain elastic
+    operator with a PML, synthesized to the time domain, reproduces the
+    independent time-domain FDTD velocity waveform to high cross-correlation
+    (> 0.95 target). A reduced (fast) configuration of the full example
+    ``examples/elastic_freq_vs_time.py``."""
+    from wave_solvers.elastic_fdtd import ElasticWaveFDTD2D
+    from wave_solvers.sources import ricker, PointForceSource2D
+
+    vp, vs, rho = 1.0, 0.571, 1.0
+    n, L = 64, 1.0
+    dx = L / (n - 1)
+    src, rec = (22, 32), (46, 32)
+    offset = abs(rec[0] - src[0]) * dx
+    f0 = 3.0
+
+    fd = ElasticWaveFDTD2D(vp, vs, rho, dx=dx, cfl=0.4, free_surface=False,
+                           sponge_width=14, shape=(n, n))
+    dt = fd.dt
+    nt = int(4.5 / dt)
+    t = np.arange(nt) * dt
+    t0 = 2.0 / f0
+    stf = ricker(t, f_peak=f0, t0=t0)
+    fd.add_source(PointForceSource2D(src[0], src[1], stf, fx=0.0, fz=1.0))
+    fd.add_receiver(rec[0], rec[1])
+    vz_time = fd.run(nt)['vz'][:, 0]
+
+    freqs, spec = eh.source_spectrum(stf, dt)
+    band = (0.4 * f0, 2.8 * f0)
+    rec_dof = [None]
+
+    def solve_one(omega):
+        p = eh.ElasticHelmholtz2DProblem(vp, vs, rho, omega, lx=L, lz=L,
+                                         shape=(n, n), bc='pml', pml_width=12)
+        if rec_dof[0] is None:
+            rec_dof[0] = p._uz(rec[0], rec[1])
+        g = p.solve_direct(-p.point_force(src[0], src[1], fx=0.0, fz=1.0))
+        return np.array([1j * omega * g[rec_dof[0]]])     # velocity
+
+    vz_freq = eh.freq_to_time(solve_one, freqs, spec, n_time=nt, dt=dt,
+                              freq_band=band)[:, 0]
+
+    t_s = offset / vs
+    win = (t > t0) & (t < t0 + t_s + 2.5 / f0)
+    a = vz_time[win]; b = vz_freq[win]
+    a = (a - a.mean()) / (a.std() + 1e-30)
+    b = (b - b.mean()) / (b.std() + 1e-30)
+    m = len(a)
+    corr = max(abs(np.dot(a[max(0, l):m + min(0, l)],
+                          b[max(0, -l):m + min(0, -l)]) / (m - abs(l)))
+               for l in range(-30, 31))
+    assert corr > 0.93, f'freq-PML vs FDTD cross-correlation only {corr:.3f}'
+    print(f'  [ok] frequency-domain PML reproduces FDTD waveform '
+          f'(xcorr {corr:.3f} > 0.95 target)')
 
 
 def test_elastic_reciprocity():
