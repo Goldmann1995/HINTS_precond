@@ -32,9 +32,9 @@ from wave_solvers import hints_bridge as hb
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--grid', type=int, default=24)
-    ap.add_argument('--epochs', type=int, default=1600)
-    ap.add_argument('--n-per-omega', type=int, default=400)
+    ap.add_argument('--grid', type=int, default=32)
+    ap.add_argument('--epochs', type=int, default=1500)
+    ap.add_argument('--n-per-omega', type=int, default=350)
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
@@ -42,11 +42,13 @@ def main():
     n = args.grid
     vp = np.ones((n, n)); vs = 0.571 * np.ones((n, n)); rho = np.ones((n, n))
 
+    # PML boundaries give clean, non-resonant solutions (far more learnable
+    # than the thin diagonal absorbing layer -- see STAGE3_REPORT.md §3).
     def factory(omega):
         return eh.ElasticHelmholtz2DProblem(vp, vs, rho, omega, shape=(n, n),
-                                            bc='absorbing', abl_width=6)
+                                            bc='pml', pml_width=8)
 
-    train_w = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    train_w = [4.0, 5.0, 6.0, 7.0, 8.0]
     held_out = [4.5, 6.5]
     print(f'Training frequencies omega = {train_w}')
     print(f'Held-out frequencies omega = {held_out}')
@@ -58,7 +60,7 @@ def main():
     f_te, u_te, w_te = hb.generate_multifreq_dataset(factory, held_out, 30, rng=rng)
 
     static = np.stack([vp, vs], axis=-1)
-    don = hb.MultiFreqVectorDeepONet2D(n, n, static, omega_ref=max(train_w),
+    don = hb.MultiFreqVectorDeepONet2D(n, n, static, omega_ref=8.0,
                                        n_comp=2, latent=64)
     print(f'Training one MultiFreqVectorDeepONet2D ({args.epochs} epochs)...')
     t0 = time.time()
