@@ -652,6 +652,198 @@ class VectorComplexDeepONet2D:
         self.model.eval()
 
 
+def _build_multifreq_module_classes():
+    """Module factory for the multi-frequency vector DeepONet: the branch is
+    additionally conditioned on the (normalized) angular frequency omega so a
+    single network amortizes the whole acoustic-emission band (roadmap §4
+    Stage 3). omega is embedded with Fourier features and concatenated to the
+    flattened convolutional code."""
+    torch = _require_torch()
+    import torch.nn as nn
+
+    class _MFBranch(nn.Module):
+        def __init__(self, latent, in_ch, n_heads, omega_feats=8):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_ch, 32, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
+                nn.AdaptiveAvgPool2d(4), nn.Flatten())
+            self.register_buffer('wfreq', torch.linspace(1, omega_feats,
+                                                         omega_feats))
+            self.fc = nn.Sequential(
+                nn.Linear(128 * 16 + 2 * omega_feats, 256), nn.ReLU(),
+                nn.Linear(256, n_heads * latent))
+            self.latent = latent
+            self.n_heads = n_heads
+
+        def forward(self, x, omega_norm):
+            h = self.conv(x)
+            proj = omega_norm[:, None] * self.wfreq[None, :]
+            wemb = torch.cat([torch.sin(proj), torch.cos(proj)], dim=1)
+            h = self.fc(torch.cat([h, wemb], dim=1))
+            return [h[:, i * self.latent:(i + 1) * self.latent]
+                    for i in range(self.n_heads)]
+
+    class _MFTrunk(nn.Module):
+        def __init__(self, latent, n_freq=48, scale=6.0):
+            super().__init__()
+            self.register_buffer('B', torch.randn(2, n_freq) * scale)
+            self.net = nn.Sequential(
+                nn.Linear(2 * n_freq, 128), nn.ReLU(),
+                nn.Linear(128, 128), nn.ReLU(),
+                nn.Linear(128, latent))
+
+        def forward(self, c):
+            proj = 2.0 * np.pi * (c @ self.B)
+            return self.net(torch.cat([torch.sin(proj), torch.cos(proj)], 1))
+
+    class _MFModule(nn.Module):
+        def __init__(self, latent, in_ch, n_heads):
+            super().__init__()
+            self.branch = _MFBranch(latent, in_ch, n_heads)
+            self.trunk = _MFTrunk(latent)
+
+    return _MFModule
+
+
+try:  # pragma: no cover
+    _MultiFreqModule = _build_multifreq_module_classes()
+except ImportError:
+    _MultiFreqModule = None
+
+
+class MultiFreqVectorDeepONet2D:
+    """Multi-frequency, complex, vector-valued DeepONet (Stage 3).
+
+    A single network approximates ``A(omega)^{-1}`` across a band of angular
+    frequencies: the branch is conditioned on the normalized ``omega`` (so the
+    one operator can be reused at every frequency of an ``freq_to_time`` AE
+    synthesis, instead of training a separate network per frequency).
+
+    Same field/channel conventions as ``VectorComplexDeepONet2D``; ``apply``
+    and ``_forward_fields`` additionally take ``omega``.
+    """
+
+    def __init__(self, nx, nz, static_fields, omega_ref, n_comp=2, latent=64,
+                 device='cpu'):
+        torch = _require_torch()
+        self.torch = torch
+        self.nx, self.nz, self.n_comp = nx, nz, n_comp
+        self.omega_ref = float(omega_ref)
+        self.device = device
+        static = np.atleast_3d(np.asarray(static_fields, dtype=float))
+        if static.shape[:2] == (nx, nz):
+            static = np.moveaxis(static, -1, 0)
+        self.n_static = static.shape[0]
+        self._static_norm = np.stack(
+            [(s - s.mean()) / (s.std() + 1e-8) for s in static], axis=0)
+        in_ch = self.n_static + 2 * n_comp
+        x = np.linspace(0.0, 1.0, nx)
+        z = np.linspace(0.0, 1.0, nz)
+        xx, zz = np.meshgrid(x, z, indexing='ij')
+        coords = np.stack([xx.reshape(-1), zz.reshape(-1)], axis=1)
+        self._coords = torch.tensor(coords, dtype=torch.float32, device=device)
+        self.model = _MultiFreqModule(latent, in_ch, 2 * n_comp).to(device)
+
+    def _forward_fields(self, f_fields, omegas):
+        torch = self.torch
+        f = np.asarray(f_fields, dtype=complex)
+        b = f.shape[0]
+        norm = np.sqrt(np.mean(np.abs(f) ** 2, axis=(1, 2, 3)))
+        norm = np.where(norm > 0, norm, 1.0)
+        f_n = f / norm[:, None, None, None]
+        static = np.broadcast_to(self._static_norm,
+                                 (b, self.n_static, self.nx, self.nz))
+        chans = [static]
+        for c in range(self.n_comp):
+            chans.append(f_n[:, c].real[:, None])
+            chans.append(f_n[:, c].imag[:, None])
+        branch_in = torch.tensor(np.concatenate(chans, axis=1),
+                                 dtype=torch.float32, device=self.device)
+        omega_norm = torch.tensor(np.asarray(omegas) / self.omega_ref,
+                                  dtype=torch.float32, device=self.device)
+        trunk = self.model.trunk(self._coords)
+        heads = self.model.branch(branch_in, omega_norm)
+        scale = torch.tensor(norm, dtype=torch.float32,
+                             device=self.device)[:, None]
+        u_re = torch.stack(
+            [(heads[2 * c] @ trunk.T * scale).reshape(b, self.nx, self.nz)
+             for c in range(self.n_comp)], dim=1)
+        u_im = torch.stack(
+            [(heads[2 * c + 1] @ trunk.T * scale).reshape(b, self.nx, self.nz)
+             for c in range(self.n_comp)], dim=1)
+        return u_re, u_im
+
+    def apply(self, residual_field, omega):
+        torch = self.torch
+        with torch.no_grad():
+            u_re, u_im = self._forward_fields(residual_field[None], [omega])
+        return u_re[0].cpu().numpy() + 1j * u_im[0].cpu().numpy()
+
+    def fit(self, f_train, u_train, omega_train, epochs=2000, batch_size=64,
+            lr=1e-3, val=None, log_every=200, logger=print):
+        """Train on ``(f, u, omega)`` triples. ``val`` is an optional
+        ``(f_val, u_val, omega_val)`` tuple for the logged metric."""
+        torch = self.torch
+        opt = torch.optim.Adam(self.model.parameters(), lr=lr)
+        sched = torch.optim.lr_scheduler.ExponentialLR(opt, 0.5 ** (1 / 1500))
+        n = f_train.shape[0]
+        omega_train = np.asarray(omega_train)
+        u_re_t = torch.tensor(u_train.real, dtype=torch.float32, device=self.device)
+        u_im_t = torch.tensor(u_train.imag, dtype=torch.float32, device=self.device)
+        hist = []
+        for ep in range(epochs):
+            perm = np.random.permutation(n)
+            ep_loss = 0.0
+            for s in range(0, n, batch_size):
+                idx = perm[s:s + batch_size]
+                pre_re, pre_im = self._forward_fields(f_train[idx],
+                                                      omega_train[idx])
+                loss = (torch.mean((pre_re - u_re_t[idx]) ** 2)
+                        + torch.mean((pre_im - u_im_t[idx]) ** 2))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                ep_loss += loss.item() * len(idx)
+            sched.step()
+            ep_loss /= n
+            hist.append(ep_loss)
+            if (ep + 1) % log_every == 0 or ep == 0:
+                msg = f'  epoch {ep + 1:5d}  train_mse {ep_loss:.3e}'
+                if val is not None:
+                    msg += f'  val_rel {self.relative_error(*val):.3e}'
+                logger(msg)
+        return np.array(hist)
+
+    def relative_error(self, f_fields, u_fields, omegas):
+        torch = self.torch
+        with torch.no_grad():
+            u_re, u_im = self._forward_fields(f_fields, omegas)
+        pred = u_re.cpu().numpy() + 1j * u_im.cpu().numpy()
+        num = np.linalg.norm((pred - u_fields).reshape(len(f_fields), -1), axis=1)
+        den = np.linalg.norm(u_fields.reshape(len(f_fields), -1), axis=1) + 1e-30
+        return float(np.mean(num / den))
+
+    def per_frequency_error(self, f_fields, u_fields, omegas):
+        """Mean relative error grouped by frequency -- shows that accuracy is
+        stable across the band (the point of amortization)."""
+        omegas = np.asarray(omegas)
+        out = {}
+        for w in np.unique(omegas):
+            m = omegas == w
+            out[float(w)] = self.relative_error(f_fields[m], u_fields[m],
+                                                omegas[m])
+        return out
+
+    def save(self, path):
+        self.torch.save(self.model.state_dict(), path)
+
+    def load(self, path):
+        self.model.load_state_dict(self.torch.load(path, map_location=self.device))
+        self.model.eval()
+
+
 # ===========================================================================
 # Dataset generation helper
 # ===========================================================================
@@ -692,3 +884,27 @@ def generate_dataset(problem, n_samples, rng=None, n_blobs=3, point_frac=0.3):
         f_fields[i] = f.reshape(field_shape)
         u_fields[i] = u.reshape(field_shape)
     return f_fields, u_fields
+
+
+def generate_multifreq_dataset(problem_factory, omegas, n_per_omega, rng=None,
+                               n_blobs=3):
+    """Build a multi-frequency training set for ``MultiFreqVectorDeepONet2D``.
+
+    ``problem_factory(omega)`` returns a problem at that angular frequency.
+    For each omega in ``omegas`` the operator is factorized once and
+    ``n_per_omega`` random RHS are solved. Returns ``(f_fields, u_fields,
+    omega_array)`` stacked over all frequencies.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    f_all, u_all, w_all = [], [], []
+    for omega in omegas:
+        p = problem_factory(omega)
+        block = getattr(p, 'block_size', 1)
+        shape = (p.nx, p.nz) if block == 1 else (block, p.nx, p.nz)
+        lu = spla.splu(p.A.tocsc())
+        for _ in range(n_per_omega):
+            f = p.smooth_random_source(rng=rng, n_blobs=n_blobs)
+            f_all.append(f.reshape(shape))
+            u_all.append(lu.solve(f).reshape(shape))
+            w_all.append(omega)
+    return (np.array(f_all), np.array(u_all), np.array(w_all))
